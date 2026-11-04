@@ -1,0 +1,5 @@
+name: GH232 Results artifact producer
+description: Create inert trust-split artifacts with the job Results capability
+runs:
+  using: node20
+  main: index.js
