@@ -1,0 +1,192 @@
+name: GH232 protected consumer
+on:
+  workflow_run:
+    workflows: ["GH232 lower-trust producer"]
+    types: [completed]
+permissions:
+  actions: read
+  contents: read
+  statuses: write
+jobs:
+  consume:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download trusted routing metadata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: gh232-bootstrap
+          path: ${{ runner.temp }}/gh232-bootstrap
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Parse and validate trusted routing metadata
+        id: bootstrap
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          path=os.path.join(os.environ['RUNNER_TEMP'],'gh232-bootstrap','gh232-bootstrap.json')
+          with open(path, encoding='utf-8') as handle: value=json.load(handle)
+          repo=value.get('head_repository',''); head=value.get('head_sha','')
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repo): raise RuntimeError('invalid repository')
+          if not re.fullmatch(r'[0-9a-f]{40}',head): raise RuntimeError('invalid head sha')
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as handle:
+              handle.write('repository='+repo+'\n')
+              handle.write('sha='+head+'\n')
+          PY
+      - name: Check out PR tree as inert data
+        shell: bash
+        env:
+          GH232_HEAD_REPOSITORY: ${{ steps.bootstrap.outputs.repository }}
+          GH232_HEAD_SHA: ${{ steps.bootstrap.outputs.sha }}
+        run: |
+          set -eu
+          mkdir -p "$GITHUB_WORKSPACE/pr-source"
+          git -C "$GITHUB_WORKSPACE/pr-source" init --quiet
+          git -C "$GITHUB_WORKSPACE/pr-source" remote add origin "https://github.com/$GH232_HEAD_REPOSITORY.git"
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= -C "$GITHUB_WORKSPACE/pr-source" fetch --quiet --depth=1 origin "$GH232_HEAD_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE/pr-source" rev-parse FETCH_HEAD)" = "$GH232_HEAD_SHA"
+          git -C "$GITHUB_WORKSPACE/pr-source" -c core.hooksPath=/dev/null checkout --quiet --detach --force "$GH232_HEAD_SHA"
+      - name: Prepare trusted parents and isolated PR-data trees
+        shell: bash
+        run: |
+          set -eu
+          root="$RUNNER_TEMP/gh232-boundary"
+          for cell in candidate deny-content no-link sanitized; do
+            mkdir -p "$root/$cell/trusted" "$root/$cell/pr-data"
+            printf '%s\n' 'GH232_POLICY=DENY' > "$root/$cell/trusted/policy.sh"
+            cp -a "$GITHUB_WORKSPACE/pr-source/." "$root/$cell/pr-data/"
+          done
+          test -L "$root/candidate/pr-data/data"
+          test -L "$root/deny-content/pr-data/data"
+          test -L "$root/sanitized/pr-data/data"
+          rm "$root/no-link/pr-data/data"
+          mkdir "$root/no-link/pr-data/data"
+          printf '%s\n' 'GH232_PR_DATA' > "$root/no-link/pr-data/data/policy.sh"
+      - name: Post initial required denial
+        shell: bash
+        env:
+          GH232_TOKEN: ${{ github.token }}
+          GH232_REPOSITORY: ${{ github.repository }}
+          GH232_HEAD_SHA: ${{ steps.bootstrap.outputs.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, urllib.request
+          repo = os.environ['GH232_REPOSITORY']; head = os.environ['GH232_HEAD_SHA']; token = os.environ['GH232_TOKEN']
+          if not re.fullmatch(r'[0-9a-f]{40}', head): raise RuntimeError('invalid head sha')
+          url = 'https://api.github.com/repos/' + repo + '/statuses/' + head
+          data = json.dumps({'state':'failure','context':'gh232/policy-gate','description':'trusted policy denied before artifact consumption'}).encode()
+          req = urllib.request.Request(url, data=data, method='POST', headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10','Content-Type':'application/json','User-Agent':'gh232-trusted-consumer'})
+          with urllib.request.urlopen(req, timeout=60) as response:
+              rid = response.headers.get('x-github-request-id') or ''
+              record = {'status':response.status,'request_id_sha256':hashlib.sha256(rid.encode()).hexdigest(),'request_id_present':bool(rid),'head_sha256':hashlib.sha256(head.encode()).hexdigest()}
+          root=os.path.join(os.environ['RUNNER_TEMP'],'gh232-boundary')
+          with open(os.path.join(root,'pre-status.json'),'w') as handle: json.dump(record,handle,sort_keys=True)
+          PY
+      - name: Candidate download through PR symlink
+        id: candidate_download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: candidate-artifact
+          path: ${{ runner.temp }}/gh232-boundary/candidate/pr-data
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Deny-content control download through PR symlink
+        id: deny_content_download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: deny-content-control-artifact
+          path: ${{ runner.temp }}/gh232-boundary/deny-content/pr-data
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: No-link control download
+        id: no_link_download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: no-link-control-artifact
+          path: ${{ runner.temp }}/gh232-boundary/no-link/pr-data
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Sanitized-member control download
+        id: sanitized_download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: sanitized-control-artifact
+          path: ${{ runner.temp }}/gh232-boundary/sanitized/pr-data
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Trusted parser and protected result
+        if: always()
+        shell: bash
+        env:
+          GH232_TOKEN: ${{ github.token }}
+          GH232_REPOSITORY: ${{ github.repository }}
+          GH232_HEAD_SHA: ${{ steps.bootstrap.outputs.sha }}
+          GH232_PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
+          GH232_PRODUCER_ACTOR: ${{ github.event.workflow_run.actor.login }}
+          GH232_CANDIDATE_OUTCOME: ${{ steps.candidate_download.outcome }}
+          GH232_DENY_CONTENT_OUTCOME: ${{ steps.deny_content_download.outcome }}
+          GH232_NO_LINK_OUTCOME: ${{ steps.no_link_download.outcome }}
+          GH232_SANITIZED_OUTCOME: ${{ steps.sanitized_download.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, stat, urllib.request
+          root=os.path.join(os.environ['RUNNER_TEMP'],'gh232-boundary')
+          producer_run=os.environ['GH232_PRODUCER_RUN_ID']
+          deny=b'GH232_POLICY=DENY\n'; allow=('GH232_POLICY=ALLOW:'+producer_run+'\n').encode()
+          def digest(value): return hashlib.sha256(value.encode() if isinstance(value,str) else value).hexdigest()
+          def state(cell):
+              trusted=os.path.join(root,cell,'trusted','policy.sh')
+              link=os.path.join(root,cell,'pr-data','data')
+              body=open(trusted,'rb').read() if os.path.isfile(trusted) else b''
+              info=os.lstat(link) if os.path.lexists(link) else None
+              return {
+                  'trusted_policy_sha256':digest(body),'trusted_policy_size':len(body),
+                  'trusted_exact_deny':body==deny,'trusted_exact_allow':body==allow,
+                  'pr_data_inode_kind':'symlink' if info and stat.S_ISLNK(info.st_mode) else 'directory' if info and stat.S_ISDIR(info.st_mode) else None,
+                  'pr_data_canonical_target_sha256':digest(os.path.realpath(link)) if info else None,
+                  'pr_data_resolves_to_trusted_parent':bool(info) and os.path.realpath(link)==os.path.dirname(trusted),
+              }
+          cells={'candidate':state('candidate'),'deny_content':state('deny-content'),'no_link':state('no-link'),'sanitized':state('sanitized')}
+          candidate_allow=cells['candidate']['trusted_exact_allow']
+          controls_hold=cells['deny_content']['trusted_exact_deny'] and cells['no_link']['trusted_exact_deny'] and cells['sanitized']['trusted_exact_deny']
+          repo=os.environ['GH232_REPOSITORY']; head=os.environ['GH232_HEAD_SHA']; token=os.environ['GH232_TOKEN']
+          if not re.fullmatch(r'[0-9a-f]{40}',head): raise RuntimeError('invalid head sha')
+          final_state='success' if candidate_allow else 'failure'
+          url='https://api.github.com/repos/'+repo+'/statuses/'+head
+          data=json.dumps({'state':final_state,'context':'gh232/policy-gate','description':'trusted parser result after artifact consumption'}).encode()
+          req=urllib.request.Request(url,data=data,method='POST',headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10','Content-Type':'application/json','User-Agent':'gh232-trusted-consumer'})
+          with urllib.request.urlopen(req,timeout=60) as response:
+              rid=response.headers.get('x-github-request-id') or ''
+              final_status={'status':response.status,'state':final_state,'request_id_present':bool(rid),'request_id_sha256':digest(rid),'head_sha256':digest(head)}
+          with open(os.path.join(root,'pre-status.json')) as handle: pre_status=json.load(handle)
+          evidence={
+              'schema':'gh232-runner-trustsplit/v1','producer_run_id_sha256':digest(producer_run),
+              'producer_actor_login_sha256':digest(os.environ['GH232_PRODUCER_ACTOR']),
+              'consumer_actor_login_sha256':digest(os.environ.get('GITHUB_ACTOR','')),
+              'consumer_job_sha256':digest(os.environ.get('GITHUB_JOB','')),
+              'workflow_declared_permissions_sha256':digest(b'actions:read,contents:read,statuses:write'),
+              'head_sha256':digest(head),'policy_context_sha256':digest('gh232/policy-gate'),
+              'pre_policy_sha256':digest(deny),'expected_allow_sha256':digest(allow),
+              'cells':cells,'candidate_allow':candidate_allow,'controls_hold':controls_hold,
+              'download_outcomes':{'candidate':os.environ['GH232_CANDIDATE_OUTCOME'],'deny_content':os.environ['GH232_DENY_CONTENT_OUTCOME'],'no_link':os.environ['GH232_NO_LINK_OUTCOME'],'sanitized':os.environ['GH232_SANITIZED_OUTCOME']},
+              'pre_status':pre_status,'final_status':final_status,
+              'pr_code_executed':False,'policy_file_executed':False,'trusted_parser_only':True,
+              'system_files_read':False,'secrets_read':False,'consumer_token_retained':False,
+              'raw_tokens_or_request_ids_retained':False,
+          }
+          with open(os.path.join(root,'consumer-evidence.json'),'w') as handle: json.dump(evidence,handle,sort_keys=True)
+          print(json.dumps({'candidate_allow':candidate_allow,'controls_hold':controls_hold,'final_state':final_state,'pr_code_executed':False},sort_keys=True))
+          PY
+      - name: Preserve sanitized consumer evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gh232-consumer-evidence
+          path: ${{ runner.temp }}/gh232-boundary/consumer-evidence.json
+          if-no-files-found: error
