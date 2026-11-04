@@ -1,0 +1,33 @@
+name: GH232 lower-trust producer
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  produce:
+    if: github.event.pull_request.head.repo.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted base action only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-base
+          persist-credentials: false
+      - name: Produce controlled Results artifacts
+        uses: ./trusted-base/.github/actions/gh232-producer
+      - name: Preserve sanitized producer lineage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gh232-producer-diagnostic
+          path: ${{ runner.temp }}/gh232-producer-diagnostic.json
+          if-no-files-found: error
+      - name: Preserve trusted consumer routing metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gh232-bootstrap
+          path: ${{ runner.temp }}/gh232-bootstrap.json
+          if-no-files-found: error
